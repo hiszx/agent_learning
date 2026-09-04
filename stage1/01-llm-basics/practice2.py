@@ -73,3 +73,4 @@ for label, prompt in prompts.items():
         f"{label}: prompt_tokens = {prompt_tokens[0]}"
         f" completion min/max/mean = {min(completion_tokens)}/{max(completion_tokens)}/{statistics.mean(completion_tokens):.1f}"
     )
+# https://platform.claude.com/docs/en/agents-and-tools/tool-use/how-tool-use-works
