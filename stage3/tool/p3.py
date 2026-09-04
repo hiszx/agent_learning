@@ -1,4 +1,4 @@
-# Azure OpenAI 版：第 2 环，智能体循环。
+# Azure OpenAI 版：第 3 环，多个工具，并行调用。
 
 import json
 import os
@@ -12,8 +12,7 @@ from openai import AzureOpenAI
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# 从工作区根目录读取 .env，沿用你前面 stage1 的配置方式。
-# override=True 可以避免终端里旧的同名环境变量把 .env 的值盖掉。
+# 从工作区根目录读取 .env，沿用前面示例的配置方式。
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 
 
@@ -34,9 +33,17 @@ def run_tool(name: str, arguments: dict) -> dict:
             "status": "created",
             "title": arguments["title"],
         }
+    if name == "list_calendar_events":
+        return {
+            "events": [
+                {
+                    "title": "Existing meeting",
+                    "start": "14:00",
+                    "end": "15:00",
+                }
+            ]
+        }
     return {"error": f"Unknown tool: {name}"}
-
-
 # 创建 Azure OpenAI 客户端。
 # model 位置传的是 Azure 部署名，不是公开模型名。
 client = AzureOpenAI(
@@ -45,9 +52,8 @@ client = AzureOpenAI(
     api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-02-01-preview"),
 )
 
-# 这里定义一个工具。Anthropic 文档里的 input_schema，
-# 在 Azure OpenAI 里对应 function.parameters。
-# 模型不会真的执行函数，它只会“提出想调用哪个工具、带什么参数”。
+# Anthropic 的 tools[].input_schema，
+# 在 Azure OpenAI 里对应 tools[].function.parameters。
 tools = [
     {
         "type": "function",
@@ -78,15 +84,29 @@ tools = [
                 "required": ["title", "start", "end"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_calendar_events",
+            "description": "List all calendar events on a given date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "YYYY-MM-DD date"},
+                },
+                "required": ["date"],
+            },
+        },
+    },
 ]
 
-# 第 2 环不再只发一轮，而是维护完整对话历史。
-# 每轮都会把新消息追加到 messages 里，再继续请求模型。
+# 第 3 环继续维护完整对话历史，区别是这次模型可能在一轮里
+# 返回多个 tool_calls，因此要把这一轮所有结果都补回去。
 messages = [
     {
         "role": "user",
-        "content": "Schedule a weekly team standup every Monday at 9am for the next 4 weeks. Invite the whole team: alice@example.com, bob@example.com, carol@example.com.",
+        "content": "Check what I have next Monday, then schedule a planning session that avoids any conflicts.",
     }
 ]
 
@@ -98,8 +118,6 @@ response = client.chat.completions.create(
     temperature=0,
 )
 
-# 循环直到模型不再请求工具。
-# Azure/OpenAI 风格里，判断条件不是 stop_reason，而是是否存在 tool_calls。
 while True:
     choice = response.choices[0]
     message = choice.message
@@ -109,8 +127,8 @@ while True:
     if not tool_calls:
         break
 
-    # 先把 assistant 这轮发出的 tool_calls 追加进历史。
-    # 后续 role="tool" 的结果必须接在这条 assistant 消息后面。
+    # 一条 assistant 消息里可能带多个工具调用，
+    # 后面的多个 role="tool" 结果都要接在它后面。
     messages.append(
         {
             "role": "assistant",
@@ -129,21 +147,21 @@ while True:
         }
     )
 
-    # Claude 第 2 环只演示“多轮循环”，不展开“单轮多个工具”。
-    # 因此这里显式只处理这一轮里的第一个工具调用。
-    tool_call = tool_calls[0]
-    print(f"Tool: {tool_call.function.name}")
-    print(f"Input: {tool_call.function.arguments}")
-    arguments = json.loads(tool_call.function.arguments)
-    result = run_tool(tool_call.function.name, arguments)
-
-    messages.append(
-        {
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": json.dumps(result, ensure_ascii=False),
-        }
-    )
+    # 第 3 环的重点不是外层 while，而是这一轮里可能有多个工具调用。
+    # 因此这里要遍历当前 assistant 消息中的所有 tool_calls，
+    # 并在再次请求模型前，把它们的结果全部补回历史。
+    for tool_call in tool_calls:
+        print(f"Tool: {tool_call.function.name}")
+        print(f"Input: {tool_call.function.arguments}")
+        arguments = json.loads(tool_call.function.arguments)
+        result = run_tool(tool_call.function.name, arguments)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            }
+        )
 
     response = client.chat.completions.create(
         model=require_env("AZURE_OPENAI_DEPLOYMENT"),
